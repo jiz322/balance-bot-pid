@@ -1,0 +1,48 @@
+    This works for standing still
+    python classical_mit.py \
+    --kd 1.0 \
+    --pitch-kp 40 \
+    --pitch-kd 1.5 \
+    --vel-kp 0.005 \
+    --vel-ki 0.002 \
+    --pos-kp 0.05 \
+    --gravity-ff 1.0 \
+    --yaw-kp 0.1 \
+    --print-every 50
+
+
+For Classical:
+ython classical_mit.py \
+    --kd 0.8 \
+    --gravity-ff 0.0 \
+    --pitch-kp 45 \
+    --pitch-kd 3   \  
+    --vel-kp 0.08  \
+    --vel-ki 0.01 \
+    --pos-kp 0 \
+    --yaw-kp 0.5  \   
+    --print-every 20 \
+    --cmd-yaw 0.0 \
+    --cmd-vel 1.2
+
+For RL:
+    python classical_mit.py \
+    --kd 0.8 \
+    --pitch-kp 35 \
+    --pitch-kd 3 \
+    --vel-kp 0.08 \
+    --vel-ki 0.01 \
+    --pos-kp 0.0 \
+    --gravity-ff 0.0 \
+    --yaw-kp 0.5 \
+    --yaw-kp 0.1 \
+    --print-every 50  \
+    --cmd-yaw 0.0 \
+    --cmd-vel 0.0
+
+
+# current best standing
+    python classical_mit_400hz.py     --kd 0.60     --pitch-kp 55     --pitch-kd 4     --vel-kp 0.08     --vel-ki 0.01     --pos-kp 0.0     --yaw-kp 0.3     --print-every 50      --cmd-yaw 0.0     --cmd-vel 0.0
+
+# this is even better
+    python classical_mit_400hz.py     --kd 0.60     --pitch-kp 75     --pitch-kd 3.5     --vel-kp 0.08     --vel-ki 0.01     --pos-kp 0.0     --yaw-kp 0.3     --print-every 50      --cmd-yaw 1.2     --cmd-vel 0.0
