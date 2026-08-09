@@ -23,7 +23,7 @@ setup.sh    One-time Pi 5 setup: deps, udev rules, permissions
 |------|---------|
 | `classical_mit.py` | PID balancer, 100 Hz loop, I2C IMU |
 | `classical_mit_400hz.py` | PID balancer, 400 Hz loop, UART IMU (recommended — best tuning results, see below) |
-| `classical_mit_rc.py` | 400 Hz PID balancer with ELRS/CRSF RC control input |
+| `classical_mit_rc.py` | 400 Hz PID balancer with RC control input — `--rc elrs` (ELRS/CRSF receiver) or `--rc web` (phone/tablet page on the LAN, no RC hardware) |
 | `test_elrs.py` | Standalone ELRS/CRSF receiver test |
 
 ### `drivers/`
@@ -36,6 +36,8 @@ setup.sh    One-time Pi 5 setup: deps, udev rules, permissions
 | `imu_driver_9_400hz.py` | Yesense YIS IMU driver, 9-axis (+mag), 400 Hz |
 | `imu_driver_i2c.py` | IMU driver over I2C |
 | `crsf_reader.py` | ELRS/CRSF RC receiver frame parser |
+| `web_rc.py` | LAN web RC receiver — serves a touch page, reports CRSF channels (drop-in for `crsf_reader.py`) |
+| `web_rc_page.html` | The touch control page served by `web_rc.py` |
 | `rc_mapper.py` | Maps CRSF RC channels to balance-robot commands |
 
 ### `tools/`
@@ -66,6 +68,41 @@ python3 control/classical_mit_400hz.py \
 
 More tuning examples (100 Hz vs 400 Hz, standing-still vs moving) are in
 `note.txt`.
+
+## Remote Control
+
+`control/classical_mit_rc.py` takes RC input from either source. The channel
+mapping, deadband, and failsafe behaviour are identical, so tuning carries
+over between them.
+
+```bash
+# ELRS transmitter (default)
+python3 control/classical_mit_rc.py --rc elrs --elrs-port /dev/ttyAMA2
+
+# Phone / tablet over the private LAN — no RC hardware
+python3 control/classical_mit_rc.py --rc web --web-token mysecret
+```
+
+Web mode prints the URL to open, e.g. `http://192.168.1.42:8080/?token=mysecret`.
+The page is a landscape touch UI: throttle bar on the left (drag, holds
+position, double-tap to zero), a self-centering pitch/yaw pad on the right,
+and an ARM button. Arming is refused while the throttle is up.
+
+Only stdlib is used — no extra packages to install. Test the RC path on its
+own before wiring it to motors:
+
+```bash
+python3 drivers/web_rc.py --port 8080
+```
+
+**Failsafe.** Both sources disarm and zero the sticks after 0.5 s without
+frames, so a closed tab, a backgrounded phone, or WiFi dropping stops the
+robot. The browser also disarms on losing focus and after 3 failed posts.
+
+**Security.** The web server is plain HTTP with no authentication unless you
+pass `--web-token`. Anyone who can reach the Pi on the LAN can drive the
+robot. Keep it on a trusted private network, use a token, and do not
+port-forward it.
 
 ## Notes
 

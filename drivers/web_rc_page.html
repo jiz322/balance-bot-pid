@@ -1,0 +1,287 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="mobile-web-app-capable" content="yes">
+<title>Balance Bot RC</title>
+<style>
+  :root {
+    --bg: #10151c;
+    --panel: #1a222d;
+    --edge: #2b3644;
+    --ink: #e6edf5;
+    --dim: #8f9dae;
+    --live: #3ddc84;
+    --dead: #ff5c5c;
+    --accent: #4aa3ff;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body {
+    margin: 0; height: 100%; overflow: hidden;
+    background: var(--bg); color: var(--ink);
+    font: 500 15px/1.3 -apple-system, "Segoe UI", Roboto, sans-serif;
+    touch-action: none; user-select: none; -webkit-user-select: none;
+    overscroll-behavior: none;
+  }
+  #app {
+    height: 100%; display: flex; flex-direction: column;
+    padding: env(safe-area-inset-top) env(safe-area-inset-right)
+             env(safe-area-inset-bottom) env(safe-area-inset-left);
+  }
+
+  /* ── status bar ── */
+  #bar {
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 12px; background: var(--panel);
+    border-bottom: 1px solid var(--edge); flex: 0 0 auto;
+  }
+  #link { display: flex; align-items: center; gap: 6px; font-size: 13px; }
+  #dot {
+    width: 10px; height: 10px; border-radius: 50%;
+    background: var(--dead); transition: background .15s;
+  }
+  #dot.up { background: var(--live); }
+  #readout {
+    margin-left: auto; font: 500 12px/1.3 ui-monospace, Menlo, Consolas, monospace;
+    color: var(--dim); text-align: right; white-space: pre;
+  }
+  #arm {
+    border: 1px solid var(--edge); border-radius: 10px;
+    background: #232d3b; color: var(--ink);
+    font: 700 14px/1 inherit; letter-spacing: .04em;
+    padding: 11px 18px; min-width: 108px;
+  }
+  #arm.on { background: var(--dead); border-color: var(--dead); color: #fff; }
+  #arm.warn { animation: nag .4s ease 2; }
+  @keyframes nag { 50% { background: #7a5a1e; } }
+
+  /* ── control area ── */
+  #sticks {
+    flex: 1 1 auto; display: flex; gap: 12px; padding: 12px; min-height: 0;
+  }
+  .cell {
+    background: var(--panel); border: 1px solid var(--edge);
+    border-radius: 16px; position: relative; overflow: hidden;
+  }
+  .tag {
+    position: absolute; top: 8px; left: 12px; z-index: 2;
+    font-size: 11px; letter-spacing: .1em; color: var(--dim);
+  }
+  .val {
+    position: absolute; top: 8px; right: 12px; z-index: 2;
+    font: 600 12px/1 ui-monospace, Menlo, Consolas, monospace; color: var(--ink);
+  }
+
+  /* throttle — holds where you leave it */
+  #thr { flex: 0 0 34%; }
+  #thrFill {
+    position: absolute; left: 0; right: 0; bottom: 0; height: 0;
+    background: linear-gradient(0deg, #1e5e8f, #4aa3ff);
+    opacity: .55;
+  }
+  #thrGrip {
+    position: absolute; left: 0; right: 0; height: 4px; bottom: 0;
+    background: var(--accent); box-shadow: 0 0 12px rgba(74,163,255,.8);
+  }
+  #thrHint {
+    position: absolute; left: 0; right: 0; bottom: 10px;
+    text-align: center; font-size: 11px; color: var(--dim);
+  }
+
+  /* pitch / yaw — self-centering pad */
+  #pad { flex: 1 1 auto; }
+  #padCross::before, #padCross::after {
+    content: ""; position: absolute; background: var(--edge);
+  }
+  #padCross::before { left: 8%; right: 8%; top: 50%; height: 1px; }
+  #padCross::after { top: 8%; bottom: 8%; left: 50%; width: 1px; }
+  #padKnob {
+    position: absolute; width: 84px; height: 84px; margin: -42px 0 0 -42px;
+    left: 50%; top: 50%; border-radius: 50%;
+    background: radial-gradient(circle at 35% 30%, #6fb8ff, #2a6ea8);
+    box-shadow: 0 4px 18px rgba(0,0,0,.45);
+  }
+  #padHint {
+    position: absolute; left: 0; right: 0; bottom: 10px;
+    text-align: center; font-size: 11px; color: var(--dim);
+  }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="bar">
+    <span id="link"><span id="dot"></span><span id="linkText">connecting</span></span>
+    <button id="arm" type="button">ARM</button>
+    <span id="readout">thr 0.00
+pitch +0.00  yaw +0.00</span>
+  </div>
+
+  <div id="sticks">
+    <div class="cell" id="thr">
+      <span class="tag">THROTTLE · CH3</span>
+      <span class="val" id="thrVal">0.00</span>
+      <div id="thrFill"></div>
+      <div id="thrGrip"></div>
+      <div id="thrHint">drag · holds position · double-tap to zero</div>
+    </div>
+
+    <div class="cell" id="pad">
+      <span class="tag">PITCH · CH2 &nbsp;/&nbsp; YAW · CH4</span>
+      <span class="val" id="padVal">+0.00 +0.00</span>
+      <div id="padCross" style="position:absolute;inset:0"></div>
+      <div id="padKnob"></div>
+      <div id="padHint">drag · springs back to center on release</div>
+    </div>
+  </div>
+</div>
+<script>
+(function () {
+  "use strict";
+
+  var TOKEN = new URLSearchParams(location.search).get("token");
+  var SEND_MS = 40;                 // 25 Hz — server failsafe trips at 500 ms
+  var state = { throttle: 0, pitch: 0, yaw: 0, armed: false };
+
+  var el = function (id) { return document.getElementById(id); };
+  var dot = el("dot"), linkText = el("linkText"), armBtn = el("arm");
+  var readout = el("readout"), thr = el("thr"), thrFill = el("thrFill");
+  var thrGrip = el("thrGrip"), thrVal = el("thrVal");
+  var pad = el("pad"), knob = el("padKnob"), padVal = el("padVal");
+
+  var clamp = function (v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; };
+
+  function render() {
+    var pct = (state.throttle * 100).toFixed(1) + "%";
+    thrFill.style.height = pct;
+    thrGrip.style.bottom = pct;
+    thrVal.textContent = state.throttle.toFixed(2);
+    padVal.textContent = (state.pitch >= 0 ? "+" : "") + state.pitch.toFixed(2)
+      + " " + (state.yaw >= 0 ? "+" : "") + state.yaw.toFixed(2);
+    var r = pad.getBoundingClientRect();
+    knob.style.transform = "translate(" + (state.yaw * r.width * 0.42).toFixed(1)
+      + "px," + (-state.pitch * r.height * 0.42).toFixed(1) + "px)";
+    armBtn.textContent = state.armed ? "DISARM" : "ARM";
+    armBtn.classList.toggle("on", state.armed);
+  }
+
+  // ── throttle: relative drag, holds position ──────────────
+  var thrDrag = null, lastTap = 0;
+  thr.addEventListener("pointerdown", function (e) {
+    thr.setPointerCapture(e.pointerId);
+    thrDrag = { y: e.clientY, base: state.throttle,
+                h: thr.getBoundingClientRect().height };
+    var now = e.timeStamp;
+    if (now - lastTap < 320) { state.throttle = 0; thrDrag.base = 0; render(); }
+    lastTap = now;
+    e.preventDefault();
+  });
+  thr.addEventListener("pointermove", function (e) {
+    if (!thrDrag) return;
+    state.throttle = clamp(thrDrag.base + (thrDrag.y - e.clientY) / thrDrag.h,
+                           0, 1);
+    render();
+  });
+  function thrEnd() { thrDrag = null; }
+  thr.addEventListener("pointerup", thrEnd);
+  thr.addEventListener("pointercancel", thrEnd);
+
+  // ── pad: pitch / yaw, springs back to center ─────────────
+  var padId = null;
+  function padMove(e) {
+    var r = pad.getBoundingClientRect();
+    var x = (e.clientX - (r.left + r.width / 2)) / (r.width / 2);
+    var y = (e.clientY - (r.top + r.height / 2)) / (r.height / 2);
+    var m = Math.hypot(x, y);
+    if (m > 1) { x /= m; y /= m; }
+    state.yaw = clamp(x, -1, 1);
+    state.pitch = clamp(-y, -1, 1);
+    render();
+  }
+  pad.addEventListener("pointerdown", function (e) {
+    padId = e.pointerId;
+    pad.setPointerCapture(e.pointerId);
+    padMove(e);
+    e.preventDefault();
+  });
+  pad.addEventListener("pointermove", function (e) {
+    if (padId === e.pointerId) padMove(e);
+  });
+  function padEnd(e) {
+    if (padId !== e.pointerId) return;
+    padId = null;
+    state.pitch = 0; state.yaw = 0;
+    render();
+  }
+  pad.addEventListener("pointerup", padEnd);
+  pad.addEventListener("pointercancel", padEnd);
+
+  // ── arm / disarm ─────────────────────────────────────────
+  armBtn.addEventListener("click", function () {
+    if (state.armed) { safeStop(); return; }
+    if (state.throttle > 0.02) {          // no arming on a live throttle
+      armBtn.classList.remove("warn");
+      void armBtn.offsetWidth;
+      armBtn.classList.add("warn");
+      return;
+    }
+    state.armed = true;
+    render();
+  });
+
+  function safeStop() {
+    state.armed = false;
+    state.throttle = 0; state.pitch = 0; state.yaw = 0;
+    render();
+  }
+  document.addEventListener("visibilitychange", function () {
+    if (document.hidden) safeStop();
+  });
+  window.addEventListener("pagehide", safeStop);
+  window.addEventListener("blur", safeStop);
+  window.addEventListener("resize", render);
+  document.addEventListener("contextmenu", function (e) { e.preventDefault(); });
+  document.addEventListener("gesturestart", function (e) { e.preventDefault(); });
+
+  // ── uplink ───────────────────────────────────────────────
+  var headers = { "Content-Type": "application/json" };
+  if (TOKEN) headers["X-RC-Token"] = TOKEN;
+  var inFlight = false, misses = 0;
+
+  function setLink(up, note) {
+    dot.classList.toggle("up", up);
+    linkText.textContent = note;
+  }
+
+  setInterval(function () {
+    if (inFlight) return;
+    inFlight = true;
+    var t0 = performance.now();
+    fetch("/rc", { method: "POST", headers: headers,
+                   body: JSON.stringify(state) })
+      .then(function (r) {
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        return r.json();
+      })
+      .then(function (s) {
+        misses = 0;
+        var ms = Math.round(performance.now() - t0);
+        setLink(true, (s.armed ? "armed" : "disarmed") + " · " + ms + " ms");
+        readout.textContent =
+          "thr " + state.throttle.toFixed(2) + "  ch " + s.ch[0] + "\n" +
+          "pitch " + s.ch[1] + "  yaw " + s.ch[2];
+      })
+      .catch(function (err) {
+        if (++misses > 2) {
+          safeStop();
+          setLink(false, String(err.message || err).slice(0, 24));
+        }
+      })
+      .finally(function () { inFlight = false; });
+  }, SEND_MS);
+
+  render();
+})();
+</script>
+</body>
+</html>

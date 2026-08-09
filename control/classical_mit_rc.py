@@ -1,6 +1,6 @@
 """
-Classical PID Balancer — MIT Mode with ELRS RC Control
-=======================================================
+Classical PID Balancer — MIT Mode with RC Control (ELRS or Web)
+===============================================================
 Motor equation (runs at motor-controller rate, ~10-40 kHz):
     τ = Kd × (v_target − v_current) + t_ff
 
@@ -12,16 +12,22 @@ Control law (400 Hz):
     v_target_L = v_target + Δv_yaw
     v_target_R = v_target - Δv_yaw
 
-RC mapping (ELRS / CRSF on /dev/ttyAMA2):
+RC source (--rc elrs | web) — identical channel mapping either way:
     CH3 (Throttle) → cmd_vel    0.0 to 2.0
     CH2 (Pitch/E)  → cmd_pitch  -0.3 to 0.3
     CH4 (Yaw/R)    → cmd_yaw    -2.0 to 2.0
     CH8 (Aux4)     → arm/disarm (low=still, high=active)
 
+    elrs  ELRS/CRSF receiver on a serial port (default /dev/ttyAMA2)
+    web   no RC hardware — serves a touch control page on the private LAN,
+          open it on a phone or tablet. Both lose-link failsafes disarm.
+
 Usage:
     python classical_mit_rc.py
     python classical_mit_rc.py --pitch-kp 75 --pitch-kd 3.5 --kd 0.6
     python classical_mit_rc.py --elrs-port /dev/ttyAMA2
+    python classical_mit_rc.py --rc web --web-port 8080
+    python classical_mit_rc.py --rc web --web-token mysecret
 """
 
 import argparse
@@ -36,15 +42,20 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "drivers"))
 from robstride_driver import RobStrideDriver
 from imu_driver_6_400hz import IMUDriver6Axis
 from crsf_reader import CRSFReader
+from web_rc import WebRCReader
 from rc_mapper import RCMapper
 
 # ── Hardware constants ────────────────────────────────────────
 MOTOR_PORT   = '/dev/ttyUSB0'
 IMU_PORT     = '/dev/ttyAMA0'
 ELRS_PORT    = '/dev/ttyAMA2'
+WEB_HOST     = '0.0.0.0'
+WEB_PORT     = 8080
 MOTOR_IDS    = [1, 2]
 CONTROL_HZ   = 400
 DT           = 1.0 / CONTROL_HZ
+
+RC_DEADBAND  = 30    # CRSF counts, shared by RCMapper and the web stick encoder
 
 MAX_VEL_CMD   = 15.0
 MAX_TORQUE_FF = 4.0
@@ -111,10 +122,20 @@ def clamp(val, lo, hi):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Classical Balancer — MIT Mode + ELRS RC")
+    parser = argparse.ArgumentParser(description="Classical Balancer — MIT Mode + RC (ELRS or Web)")
     parser.add_argument("--motor-port",  type=str, default=MOTOR_PORT)
     parser.add_argument("--imu-port",    type=str, default=IMU_PORT)
     parser.add_argument("--elrs-port",   type=str, default=ELRS_PORT)
+    # RC source
+    parser.add_argument("--rc",          type=str, default="elrs",
+                        choices=["elrs", "web"],
+                        help="RC input: ELRS receiver, or LAN web page (no RC hardware)")
+    parser.add_argument("--web-host",    type=str, default=WEB_HOST)
+    parser.add_argument("--web-port",    type=int, default=WEB_PORT)
+    parser.add_argument("--web-token",   type=str, default=None,
+                        help="shared secret required to send web RC commands")
+    parser.add_argument("--rc-wait",     type=float, default=None,
+                        help="seconds to wait for RC link before starting")
     parser.add_argument("--auto-detect", action="store_true")
     parser.add_argument("--duration",    type=float, default=6000.0)
     parser.add_argument("--no-rt",       action="store_true")
@@ -157,28 +178,43 @@ def main():
     if not args.no_rt:
         _try_set_realtime()
 
-    # ── Init ELRS ─────────────────────────────────────────────
-    crsf = CRSFReader(args.elrs_port)
-    crsf.start()
+    # ── Init RC source ────────────────────────────────────────
+    if args.rc == "web":
+        rc_link = WebRCReader(host=args.web_host, port=args.web_port,
+                              deadband=RC_DEADBAND, token=args.web_token)
+        rc_link.start()
+        rc_source = f"web {rc_link.url}"
+        rc_wait = args.rc_wait if args.rc_wait is not None else 120.0
+        print(f"[RC] Web RC serving on {rc_link.url}")
+        if not args.web_token:
+            print("[RC] WARNING: no --web-token — anyone on this LAN can drive it")
+        print("[RC] Open that URL on your phone or tablet...")
+    else:
+        rc_link = CRSFReader(args.elrs_port)
+        rc_link.start()
+        rc_source = f"elrs {args.elrs_port} @ 420000 baud"
+        rc_wait = args.rc_wait if args.rc_wait is not None else 10.0
+        print(f"[RC] ELRS reader started on {args.elrs_port}")
+        print(f"[RC] Waiting for transmitter link...")
+
     rc = RCMapper(
         vel_range=(0.0, args.max_vel),
         pitch_range=(-args.max_cmd_pitch, args.max_cmd_pitch),
         yaw_range=(-args.max_yaw, args.max_yaw),
+        deadband=RC_DEADBAND,
     )
 
-    print(f"[RC] ELRS reader started on {args.elrs_port}")
-    print(f"[RC] Waiting for transmitter link...")
-
-    # Wait up to 10s for RC link
+    # Wait for the RC link, then start regardless (we start disarmed anyway)
     t_wait = time.monotonic()
-    while time.monotonic() - t_wait < 10.0:
-        _, connected = crsf.get_channels()
+    while time.monotonic() - t_wait < rc_wait:
+        _, connected = rc_link.get_channels()
         if connected:
-            print(f"[RC] Transmitter linked! ({time.monotonic() - t_wait:.1f}s)")
+            print(f"[RC] Link up! ({time.monotonic() - t_wait:.1f}s)")
             break
         time.sleep(0.1)
     else:
-        print("[RC] WARNING: No RC link after 10s — starting anyway (will be disarmed)")
+        print(f"[RC] WARNING: No RC link after {rc_wait:.0f}s — "
+              f"starting anyway (will be disarmed)")
 
     # ── Init hardware ─────────────────────────────────────────
     motor = RobStrideDriver(motor_port, MOTOR_IDS)
@@ -186,7 +222,7 @@ def main():
 
     if not imu.open():
         print("[Main] IMU open failed, aborting.")
-        crsf.stop()
+        rc_link.stop()
         return
 
     time.sleep(0.5)
@@ -219,10 +255,10 @@ def main():
     prev_tff_r = 0.0
 
     print(f"\n{'='*65}")
-    print(f"  Classical PID Balancer — MIT Mode + ELRS RC")
+    print(f"  Classical PID Balancer — MIT Mode + {args.rc.upper()} RC")
     print(f"{'='*65}")
     print(f"  IMU:       {args.imu_port} @ 400Hz")
-    print(f"  ELRS:      {args.elrs_port} @ 420000 baud")
+    print(f"  RC:        {rc_source}")
     print(f"  MIT Motor: Kp={HW_KP}  Kd={hw_kd}")
     print(f"  Pitch→Vel: Kp={pitch_kp:.1f}  Kd={pitch_kd:.2f}")
     print(f"  Vel→Pitch: Kp={vel_kp:.3f}  Ki={vel_ki:.3f}")
@@ -231,11 +267,14 @@ def main():
     print(f"  RC ranges: vel=[0, {args.max_vel}]  "
           f"pitch=[±{args.max_cmd_pitch}]  yaw=[±{args.max_yaw}]")
     print(f"  RC map:    CH3→vel  CH2→pitch  CH4→yaw  CH8→arm")
+    print(f"  Failsafe:  disarm after 0.5s without RC frames")
     print(f"  Safety:    pitch ±{args.max_pitch:.0f}°  vel ±{MAX_VEL_CMD:.0f} rad/s")
     print(f"  Rate:      {CONTROL_HZ} Hz")
     print(f"  Duration:  {args.duration}s — Ctrl-C to stop")
     print(f"{'='*65}")
-    print(f"\n  >>> Flip CH8 (Aux4) high to ARM <<<\n")
+    arm_hint = ("Tap ARM on the web page to ARM" if args.rc == "web"
+                else "Flip CH8 (Aux4) high to ARM")
+    print(f"\n  >>> {arm_hint} <<<\n")
 
     step = 0
     t_start = time.monotonic()
@@ -249,7 +288,7 @@ def main():
                 break
 
             # ── Read RC ───────────────────────────────────────
-            channels, rc_connected = crsf.get_channels()
+            channels, rc_connected = rc_link.get_channels()
             cmds = rc.map(channels)
             armed = cmds['armed'] and rc_connected
 
@@ -286,7 +325,7 @@ def main():
                     rc_status = "linked" if rc_connected else "NO LINK"
                     print(f"\r  [DISARMED] t={elapsed:.1f}s  "
                           f"RC={rc_status}  CH8={channels[7]:4d}  "
-                          f"Flip CH8 high to arm     ", end='', flush=True)
+                          f"{arm_hint}     ", end='', flush=True)
 
                 step += 1
                 t_end = time.monotonic()
@@ -454,7 +493,7 @@ def main():
         motor.disable_all()
         motor.close()
         imu.close()
-        crsf.stop()
+        rc_link.stop()
         print("[Main] Done.")
 
 
