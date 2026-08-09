@@ -553,6 +553,16 @@ def main():
                 print(f"  τ_estimated: L={total_l:+.3f}  R={total_r:+.3f} Nm")
                 print(f"  IMU rate:    "
                       f"{'n/a (stub)' if stub_imu else f'{imu.rate_hz:.1f} Hz'}")
+                if not stub_imu:
+                    _stats = getattr(imu.driver, 'get_read_stats', None)
+                    if _stats:
+                        _ok, _err, _age, _last = _stats()
+                        if _err or _age > 0.2:
+                            print(f"  IMU reads:   {_ok} ok, {_err} failed, "
+                                  f"last good {_age:.2f}s ago"
+                                  + (f" — {_last}" if _last else ""))
+                            if _age > 0.2:
+                                print("               *** pitch above is STALE ***")
                 print(f"{'='*65}")
 
             # ── Sleep to maintain 400 Hz ──────────────────────

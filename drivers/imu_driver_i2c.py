@@ -43,6 +43,13 @@ class IMUDriverI2c:
         self._loop_count = 0
         self._last_diag_time = 0.0
         self._actual_hz = 0.0
+        # Counted separately from _loop_count: a failed read leaves the old
+        # sample in self.data, so a healthy loop rate does not imply the data
+        # is fresh. Compare these to tell a stale reading from a live one.
+        self._read_ok = 0
+        self._read_err = 0
+        self._last_err = None
+        self._last_ok_t = 0.0
 
     def open(self):
         try:
@@ -105,9 +112,15 @@ class IMUDriverI2c:
                     gz_raw * self.gyro_scale
                 ]
 
-            except OSError:
-                pass
+                self._read_ok += 1
+                self._last_ok_t = time.monotonic()
+
+            except OSError as e:
+                self._read_err += 1
+                self._last_err = str(e)
             except Exception as e:
+                self._read_err += 1
+                self._last_err = str(e)
                 print(f"[IMU] Read error: {e}")
 
             # Diagnostics: measure actual Hz every 5 seconds
@@ -126,8 +139,17 @@ class IMUDriverI2c:
                 t_next = time.monotonic()
 
     def get_actual_hz(self):
-        """Return measured loop frequency (updated every 5s)."""
+        """Return measured loop frequency (updated every 5s).
+
+        This counts loop iterations, not successful reads. Use get_read_stats()
+        to check whether the data behind it is actually fresh.
+        """
         return self._actual_hz
+
+    def get_read_stats(self):
+        """(successful reads, failed reads, seconds since last good read, last error)."""
+        age = (time.monotonic() - self._last_ok_t) if self._last_ok_t else float('inf')
+        return self._read_ok, self._read_err, age, self._last_err
 
     def _write_register(self, reg, value):
         try:
