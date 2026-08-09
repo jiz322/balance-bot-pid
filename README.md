@@ -102,6 +102,26 @@ Two consequences worth knowing:
   sits well under the 400 Hz control loop, the pitch derivative is being fed
   repeated samples — prefer `uart6` for the fastest loop.
 
+## Bench testing with no hardware
+
+If the motors or the IMU will not open, `classical_mit_rc.py` prints a warning
+and substitutes a stub from `drivers/hw_stubs.py` instead of raising. The RC
+page, arming, channel mapping and failsafe all stay exercisable on a bare Pi
+with nothing plugged in.
+
+```bash
+python3 control/classical_mit_rc.py --rc web              # stubs fill in whatever is absent
+python3 control/classical_mit_rc.py --rc web --require-hw # abort instead — use for real runs
+```
+
+Stub mode is marked in the banner and on every status line as `[STUB]`.
+
+> The stubs have **no balance physics**. The stub IMU always reports level and
+> still, so the cascaded loop winds up against a target it can never reach and
+> the printed torques are meaningless. Stub mode tells you the RC path works.
+> It tells you nothing about whether a gain is stable. Use `--require-hw` for
+> any run you intend to draw tuning conclusions from.
+
 ## Remote Control
 
 `control/classical_mit_rc.py` takes RC input from either source. The channel

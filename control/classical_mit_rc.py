@@ -39,6 +39,13 @@ Usage:
     python classical_mit_rc.py --rc web --web-token mysecret
     python classical_mit_rc.py --imu uart6 --imu-port /dev/ttyAMA0
     python classical_mit_rc.py --imu i2c --imu-addr 0x23 --imu-hz 400
+
+Bench testing with no hardware:
+    Motors or an IMU that will not open are replaced by stubs (drivers/
+    hw_stubs.py) with a warning, so the RC page, arming and mapping stay
+    testable on a bare Pi. Stub mode has no balance physics — it says
+    nothing about whether a gain is stable. Pass --require-hw to abort on
+    a missing device instead, which is what a real run should use.
 """
 
 import argparse
@@ -52,6 +59,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "drivers"))
 
 from robstride_driver import RobStrideDriver
 from imu_select import IMU_CHOICES, make_imu
+from hw_stubs import StubIMU, StubMotor
 from crsf_reader import CRSFReader
 from web_rc import WebRCReader
 from rc_mapper import RCMapper
@@ -161,6 +169,9 @@ def main():
                         help="shared secret required to send web RC commands")
     parser.add_argument("--rc-wait",     type=float, default=None,
                         help="seconds to wait for RC link before starting")
+    parser.add_argument("--require-hw", action="store_true",
+                        help="abort if motors or IMU fail to open, instead of "
+                             "falling back to stubs")
     parser.add_argument("--auto-detect", action="store_true")
     parser.add_argument("--duration",    type=float, default=6000.0)
     parser.add_argument("--no-rt",       action="store_true")
@@ -246,15 +257,46 @@ def main():
               f"starting anyway (will be disarmed)")
 
     # ── Init hardware ─────────────────────────────────────────
-    motor = RobStrideDriver(motor_port, MOTOR_IDS)
-    imu   = make_imu(args.imu,
-                     port=args.imu_port, baud=args.imu_baud,
-                     bus=args.imu_bus, addr=args.imu_addr, hz=args.imu_hz)
+    # A device that will not open becomes a stub so the RC path stays
+    # testable on the bench, unless --require-hw asks to fail fast.
+    try:
+        motor = RobStrideDriver(motor_port, MOTOR_IDS)
+    except Exception as e:
+        if args.require_hw:
+            print(f"[Main] Motor open failed: {e}")
+            rc_link.stop()
+            return
+        print(f"[Main] Motors not connected ({e.__class__.__name__}) — "
+              f"continuing with a STUB motor. Nothing will move.")
+        motor = StubMotor(MOTOR_IDS, reason=f"{motor_port} unavailable")
 
-    if not imu.open():
-        print("[Main] IMU open failed, aborting.")
-        rc_link.stop()
-        return
+    # Construction can fail too, not just open() — a missing driver
+    # dependency (smbus2, pyserial) raises on import.
+    imu = None
+    try:
+        imu = make_imu(args.imu,
+                       port=args.imu_port, baud=args.imu_baud,
+                       bus=args.imu_bus, addr=args.imu_addr, hz=args.imu_hz)
+        imu_ok = imu.open()
+    except Exception as e:
+        print(f"[IMU] {'Open' if imu else 'Init'} raised "
+              f"{e.__class__.__name__}: {e}")
+        imu_ok = False
+
+    if not imu_ok:
+        if args.require_hw:
+            print("[Main] IMU open failed, aborting.")
+            motor.close()
+            rc_link.stop()
+            return
+        print(f"[Main] IMU ({args.imu}) not connected — continuing with a "
+              f"STUB IMU reporting level and still.")
+        imu = StubIMU(kind=args.imu, reason=f"{args.imu} unavailable")
+        imu.open()
+
+    stub_motor = isinstance(motor, StubMotor)
+    stub_imu   = isinstance(imu, StubIMU)
+    sim_mode   = stub_motor or stub_imu
 
     time.sleep(0.5)
 
@@ -287,7 +329,12 @@ def main():
 
     print(f"\n{'='*65}")
     print(f"  Classical PID Balancer — MIT Mode + {args.rc.upper()} RC")
+    if sim_mode:
+        print(f"  *** STUB MODE — {'motors' if stub_motor else ''}"
+              f"{' and ' if stub_motor and stub_imu else ''}"
+              f"{'IMU' if stub_imu else ''} not connected ***")
     print(f"{'='*65}")
+    print(f"  Motors:    {'STUB (no hardware) — nothing will move' if stub_motor else motor_port}")
     print(f"  IMU:       {imu.label}")
     print(f"  RC:        {rc_source}")
     print(f"  MIT Motor: Kp={HW_KP}  Kd={hw_kd}")
@@ -303,6 +350,10 @@ def main():
     print(f"  Rate:      {CONTROL_HZ} Hz")
     print(f"  Duration:  {args.duration}s — Ctrl-C to stop")
     print(f"{'='*65}")
+    if sim_mode:
+        print("  Stub mode is for exercising the RC path only. It has no "
+              "balance\n  physics, so nothing here indicates whether a gain "
+              "is stable.")
     arm_hint = ("Tap ARM on the web page to ARM" if args.rc == "web"
                 else "Flip CH8 (Aux4) high to ARM")
     print(f"\n  >>> {arm_hint} <<<\n")
@@ -354,7 +405,8 @@ def main():
 
                 if step % 400 == 0:
                     rc_status = "linked" if rc_connected else "NO LINK"
-                    print(f"\r  [DISARMED] t={elapsed:.1f}s  "
+                    print(f"\r  [DISARMED]{' [STUB]' if sim_mode else ''} "
+                          f"t={elapsed:.1f}s  "
                           f"RC={rc_status}  CH8={channels[7]:4d}  "
                           f"{arm_hint}     ", end='', flush=True)
 
@@ -460,6 +512,7 @@ def main():
             # ── Live status (~10 Hz) ─────────────────────────
             if step % 40 == 0:
                 print(
+                    f"{'[STUB] ' if sim_mode else ''}"
                     f"t={elapsed:6.2f} | "
                     f"RC: v={cmd_vel:.2f} p={cmd_pitch:+.3f} y={cmd_yaw:+.2f} | "
                     f"pitch={pitch_deg:+.1f}° "
@@ -498,7 +551,8 @@ def main():
                 print(f"  v_des:       L={v_target_l:+.2f}  R={v_target_r:+.2f} rad/s")
                 print(f"  t_ff:        L={tff_l:+.3f}  R={tff_r:+.3f} Nm")
                 print(f"  τ_estimated: L={total_l:+.3f}  R={total_r:+.3f} Nm")
-                print(f"  IMU rate:    {imu.rate_hz:.1f} Hz")
+                print(f"  IMU rate:    "
+                      f"{'n/a (stub)' if stub_imu else f'{imu.rate_hz:.1f} Hz'}")
                 print(f"{'='*65}")
 
             # ── Sleep to maintain 400 Hz ──────────────────────
