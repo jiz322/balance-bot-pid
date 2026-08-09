@@ -22,12 +22,23 @@ RC source (--rc elrs | web) — identical channel mapping either way:
     web   no RC hardware — serves a touch control page on the private LAN,
           open it on a phone or tablet. Both lose-link failsafes disarm.
 
+IMU source (--imu i2c | usb | uart6 | uart9), default i2c:
+    i2c    IMUDriverI2c    on the I2C bus (--imu-bus / --imu-addr / --imu-hz)
+    usb    IMUDriver       USB serial, 100 Hz
+    uart6  IMUDriver6Axis  Yesense YIS UART, 6-axis, 400 Hz
+    uart9  IMUDriver9Axis  Yesense YIS UART, 9-axis, 400 Hz
+
+    drivers/imu_select.py normalizes their differing units and euler axis
+    order, so pitch and rates reach the loop in rad and rad/s either way.
+
 Usage:
     python classical_mit_rc.py
     python classical_mit_rc.py --pitch-kp 75 --pitch-kd 3.5 --kd 0.6
     python classical_mit_rc.py --elrs-port /dev/ttyAMA2
     python classical_mit_rc.py --rc web --web-port 8080
     python classical_mit_rc.py --rc web --web-token mysecret
+    python classical_mit_rc.py --imu uart6 --imu-port /dev/ttyAMA0
+    python classical_mit_rc.py --imu i2c --imu-addr 0x23 --imu-hz 400
 """
 
 import argparse
@@ -40,14 +51,15 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "drivers"))
 
 from robstride_driver import RobStrideDriver
-from imu_driver_6_400hz import IMUDriver6Axis
+from imu_select import IMU_CHOICES, make_imu
 from crsf_reader import CRSFReader
 from web_rc import WebRCReader
 from rc_mapper import RCMapper
 
 # ── Hardware constants ────────────────────────────────────────
 MOTOR_PORT   = '/dev/ttyUSB0'
-IMU_PORT     = '/dev/ttyAMA0'
+IMU_I2C_BUS  = 1
+IMU_I2C_ADDR = 0x23
 ELRS_PORT    = '/dev/ttyAMA2'
 WEB_HOST     = '0.0.0.0'
 WEB_PORT     = 8080
@@ -63,8 +75,6 @@ MAX_PITCH_DEG = 30.0
 
 LEFT_DIR  =  1
 RIGHT_DIR = -1
-
-DEG2RAD = math.pi / 180.0
 
 # ── MIT Mode ─────────────────────────────────────────────────
 HW_KP = 0.0
@@ -124,8 +134,23 @@ def clamp(val, lo, hi):
 def main():
     parser = argparse.ArgumentParser(description="Classical Balancer — MIT Mode + RC (ELRS or Web)")
     parser.add_argument("--motor-port",  type=str, default=MOTOR_PORT)
-    parser.add_argument("--imu-port",    type=str, default=IMU_PORT)
     parser.add_argument("--elrs-port",   type=str, default=ELRS_PORT)
+    # IMU source
+    parser.add_argument("--imu",         type=str, default="i2c",
+                        choices=list(IMU_CHOICES),
+                        help="IMU driver: i2c (default), usb, uart6, uart9")
+    parser.add_argument("--imu-port",    type=str, default=None,
+                        help="serial device for usb/uart6/uart9 "
+                             "(default: per-driver, ignored for i2c)")
+    parser.add_argument("--imu-baud",    type=int, default=None,
+                        help="serial baud override for usb/uart6/uart9")
+    parser.add_argument("--imu-bus",     type=int, default=IMU_I2C_BUS,
+                        help="I2C bus number (i2c only)")
+    parser.add_argument("--imu-addr",    type=lambda v: int(v, 0),
+                        default=IMU_I2C_ADDR,
+                        help="I2C device address, e.g. 0x23 (i2c only)")
+    parser.add_argument("--imu-hz",      type=int, default=CONTROL_HZ,
+                        help="I2C polling rate target (i2c only)")
     # RC source
     parser.add_argument("--rc",          type=str, default="elrs",
                         choices=["elrs", "web"],
@@ -175,6 +200,10 @@ def main():
         except ImportError:
             pass
 
+    if args.imu == "i2c" and args.imu_port:
+        print("[IMU] Note: --imu-port is ignored for the i2c driver "
+              "(use --imu-bus / --imu-addr)")
+
     if not args.no_rt:
         _try_set_realtime()
 
@@ -218,7 +247,9 @@ def main():
 
     # ── Init hardware ─────────────────────────────────────────
     motor = RobStrideDriver(motor_port, MOTOR_IDS)
-    imu   = IMUDriver6Axis(args.imu_port)
+    imu   = make_imu(args.imu,
+                     port=args.imu_port, baud=args.imu_baud,
+                     bus=args.imu_bus, addr=args.imu_addr, hz=args.imu_hz)
 
     if not imu.open():
         print("[Main] IMU open failed, aborting.")
@@ -257,7 +288,7 @@ def main():
     print(f"\n{'='*65}")
     print(f"  Classical PID Balancer — MIT Mode + {args.rc.upper()} RC")
     print(f"{'='*65}")
-    print(f"  IMU:       {args.imu_port} @ 400Hz")
+    print(f"  IMU:       {imu.label}")
     print(f"  RC:        {rc_source}")
     print(f"  MIT Motor: Kp={HW_KP}  Kd={hw_kd}")
     print(f"  Pitch→Vel: Kp={pitch_kp:.1f}  Kd={pitch_kd:.2f}")
@@ -335,15 +366,10 @@ def main():
                 continue
 
             # ── Read sensors ──────────────────────────────────
-            euler = imu.data['euler']
-            gyro  = imu.data['gyro']
+            pitch, pitch_rate, yaw_rate = imu.read()
 
             pos_l, vel_l, _ = motor.get_state(MOTOR_IDS[0])
             pos_r, vel_r, _ = motor.get_state(MOTOR_IDS[1])
-
-            pitch      = -euler[0] * DEG2RAD
-            pitch_rate = -gyro[1]  * DEG2RAD
-            yaw_rate   = -gyro[2]  * DEG2RAD
 
             wheel_vel_l = LEFT_DIR  * vel_l
             wheel_vel_r = RIGHT_DIR * vel_r
@@ -472,7 +498,7 @@ def main():
                 print(f"  v_des:       L={v_target_l:+.2f}  R={v_target_r:+.2f} rad/s")
                 print(f"  t_ff:        L={tff_l:+.3f}  R={tff_r:+.3f} Nm")
                 print(f"  τ_estimated: L={total_l:+.3f}  R={total_r:+.3f} Nm")
-                print(f"  IMU rate:    {imu.fps:.1f} Hz")
+                print(f"  IMU rate:    {imu.rate_hz:.1f} Hz")
                 print(f"{'='*65}")
 
             # ── Sleep to maintain 400 Hz ──────────────────────

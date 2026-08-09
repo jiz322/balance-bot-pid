@@ -23,7 +23,7 @@ setup.sh    One-time Pi 5 setup: deps, udev rules, permissions
 |------|---------|
 | `classical_mit.py` | PID balancer, 100 Hz loop, I2C IMU |
 | `classical_mit_400hz.py` | PID balancer, 400 Hz loop, UART IMU (recommended — best tuning results, see below) |
-| `classical_mit_rc.py` | 400 Hz PID balancer with RC control input — `--rc elrs` (ELRS/CRSF receiver) or `--rc web` (phone/tablet page on the LAN, no RC hardware) |
+| `classical_mit_rc.py` | 400 Hz PID balancer with selectable RC input (`--rc elrs\|web`) and selectable IMU (`--imu i2c\|usb\|uart6\|uart9`) |
 | `test_elrs.py` | Standalone ELRS/CRSF receiver test |
 
 ### `drivers/`
@@ -35,6 +35,7 @@ setup.sh    One-time Pi 5 setup: deps, udev rules, permissions
 | `imu_driver_6_400hz.py` | Yesense YIS IMU driver, 6-axis (acc+gyro+euler), 400 Hz |
 | `imu_driver_9_400hz.py` | Yesense YIS IMU driver, 9-axis (+mag), 400 Hz |
 | `imu_driver_i2c.py` | IMU driver over I2C |
+| `imu_select.py` | Selects an IMU driver by name and normalizes their differing units / euler axis order |
 | `crsf_reader.py` | ELRS/CRSF RC receiver frame parser |
 | `web_rc.py` | LAN web RC receiver — serves a touch page, reports CRSF channels (drop-in for `crsf_reader.py`) |
 | `web_rc_page.html` | The touch control page served by `web_rc.py` |
@@ -68,6 +69,38 @@ python3 control/classical_mit_400hz.py \
 
 More tuning examples (100 Hz vs 400 Hz, standing-still vs moving) are in
 `note.txt`.
+
+## IMU Selection
+
+`control/classical_mit_rc.py` picks its IMU with `--imu`, default `i2c`.
+
+| `--imu` | Driver | Bus | Rate | Notes |
+|---------|--------|-----|------|-------|
+| `i2c` (default) | `IMUDriverI2c` | I2C | polled, `--imu-hz` | `--imu-bus`, `--imu-addr` |
+| `usb` | `IMUDriver` | USB serial | 100 Hz | `--imu-port`, `--imu-baud` |
+| `uart6` | `IMUDriver6Axis` | UART | 400 Hz | Yesense YIS, 6-axis |
+| `uart9` | `IMUDriver9Axis` | UART | 400 Hz | Yesense YIS, 9-axis (+mag) |
+
+```bash
+python3 control/classical_mit_rc.py                              # i2c, default
+python3 control/classical_mit_rc.py --imu i2c --imu-addr 0x23 --imu-hz 400
+python3 control/classical_mit_rc.py --imu uart6 --imu-port /dev/ttyAMA0
+```
+
+The drivers do not agree on units or axis order: the I2C and USB drivers
+report euler in **radians** ordered roll/pitch/yaw, while the two UART
+drivers report **degrees** ordered pitch/roll/yaw. `drivers/imu_select.py`
+normalizes both, so the control loop always receives rad and rad/s.
+
+Two consequences worth knowing:
+
+- Swapping drivers without that adapter reads roll as pitch and scales
+  radians by 57.3. Both conventions are live in the tree — `classical_mit.py`
+  reads `euler[1]` raw, `classical_mit_rc.py` used to read `euler[0] * DEG2RAD`.
+- `--imu-hz` is a *target*. I2C does three block reads per cycle, so 400 Hz
+  may not be reachable; the detailed print shows the measured rate. If it
+  sits well under the 400 Hz control loop, the pitch derivative is being fed
+  repeated samples — prefer `uart6` for the fastest loop.
 
 ## Remote Control
 
