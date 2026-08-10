@@ -71,7 +71,7 @@ IMU_I2C_ADDR = 0x23
 ELRS_PORT    = '/dev/ttyAMA2'
 WEB_HOST     = '0.0.0.0'
 WEB_PORT     = 8080
-MOTOR_IDS    = [1, 2]
+MOTOR_IDS    = [0, 1]
 CONTROL_HZ   = 400
 DT           = 1.0 / CONTROL_HZ
 
