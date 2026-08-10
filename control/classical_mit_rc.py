@@ -81,8 +81,8 @@ MAX_VEL_CMD   = 15.0
 MAX_TORQUE_FF = 4.0
 MAX_PITCH_DEG = 30.0
 
-LEFT_DIR  =  1
-RIGHT_DIR = -1
+LEFT_DIR  = -1
+RIGHT_DIR = 1
 
 # ── MIT Mode ─────────────────────────────────────────────────
 HW_KP = 0.0
