@@ -56,6 +56,9 @@ import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "drivers"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from debug_log import DebugLogger
 
 from robstride_driver import RobStrideDriver
 from imu_select import IMU_CHOICES, make_imu
@@ -77,9 +80,36 @@ DT           = 1.0 / CONTROL_HZ
 
 RC_DEADBAND  = 30    # CRSF counts, shared by RCMapper and the web stick encoder
 
+# Column order for --log. Must match the DebugLogger.log() call in the loop.
+LOG_FIELDS = [
+    't', 'armed', 'tripped', 'rc_ok',
+    'cmd_vel', 'cmd_pitch', 'cmd_yaw',
+    # pitch_deg is trim-corrected; pitch_raw_deg is what the IMU reported, so
+    # a wrong --pitch-trim can be diagnosed and re-derived from an old log.
+    'pitch_deg', 'pitch_raw_deg', 'pitch_f', 'pitch_rate_f', 'yaw_rate_f',
+    'avg_vel', 'avg_vel_f', 'avg_pos',
+    'vel_err', 'vel_integral', 'pitch_offset',
+    'desired_pitch', 'pitch_error', 'v_target',
+    'delta_v', 'delta_tff',
+    'v_target_l', 'v_target_r', 'tff_l', 'tff_r',
+    'wheel_vel_l', 'wheel_vel_r', 'total_l', 'total_r',
+    'loop_ms',
+]
+
 MAX_VEL_CMD   = 15.0
 MAX_TORQUE_FF = 4.0
 MAX_PITCH_DEG = 30.0
+
+# Reading the IMU reports when the robot is actually balanced, in degrees.
+# Combines IMU mounting tilt with any centre-of-mass offset. Subtracted from
+# every pitch sample, so downstream "pitch = 0" means upright, and the ±
+# MAX_PITCH_DEG trip is measured from true vertical.
+#
+# To measure: hold the bot at balance, read the printed pitch, put that number
+# here. If it reads +0.8° when balanced, this is +0.8. Getting the sign wrong
+# doubles the lean instead of removing it, so check that the printed pitch
+# lands near 0.0° at balance after changing it.
+PITCH_TRIM_DEG = 0.8
 
 LEFT_DIR  = -1
 RIGHT_DIR = 1
@@ -176,7 +206,20 @@ def main():
     parser.add_argument("--duration",    type=float, default=6000.0)
     parser.add_argument("--no-rt",       action="store_true")
     parser.add_argument("--max-pitch",   type=float, default=MAX_PITCH_DEG)
+    parser.add_argument("--pitch-trim",  type=float, default=PITCH_TRIM_DEG,
+                        metavar='DEG',
+                        help="pitch the IMU reads when actually balanced, in "
+                             "degrees; subtracted from every sample "
+                             f"(default: {PITCH_TRIM_DEG:+.2f})")
     parser.add_argument("--print-every", type=int, default=PRINT_EVERY)
+    # Debug logging
+    parser.add_argument("--log", nargs='?', const='auto', default=None,
+                        metavar='PATH',
+                        help="log every loop iteration to CSV for debugging. "
+                             "Bare --log writes logs/balance_<timestamp>.csv")
+    parser.add_argument("--log-hz", type=float, default=float(CONTROL_HZ),
+                        help="rows per second to log (default: every "
+                             "iteration). Lower it for long runs.")
     # MIT mode
     parser.add_argument("--kd",          type=float, default=HW_KD)
     # Pitch balance
@@ -202,6 +245,7 @@ def main():
     pos_kp   = args.pos_kp
     yaw_kp   = args.yaw_kp
     hw_kd    = args.kd
+    pitch_trim = math.radians(args.pitch_trim)
 
     motor_port = args.motor_port
     if args.auto_detect:
@@ -317,6 +361,11 @@ def main():
     pitch_offset   = 0.0
     prev_yaw_rate  = 0.0
     was_armed      = False
+    # Latched by the pitch safety trip. Blocks arming until the operator
+    # cycles the arm switch/button low again, so the bot cannot re-arm on
+    # its own just because it swung back through vertical while on the floor.
+    safety_tripped = False
+    trip_count     = 0
 
     pitch_filter      = LowPassFilter(alpha=0.12)
     pitch_rate_filter = LowPassFilter(alpha=0.12)
@@ -347,6 +396,8 @@ def main():
     print(f"  RC map:    CH3→vel  CH2→pitch  CH4→yaw  CH8→arm")
     print(f"  Failsafe:  disarm after 0.5s without RC frames")
     print(f"  Safety:    pitch ±{args.max_pitch:.0f}°  vel ±{MAX_VEL_CMD:.0f} rad/s")
+    print(f"  Pitch trim:{args.pitch_trim:+.2f}° "
+          f"(balanced reads 0.0° after correction)")
     print(f"  Rate:      {CONTROL_HZ} Hz")
     print(f"  Duration:  {args.duration}s — Ctrl-C to stop")
     print(f"{'='*65}")
@@ -358,12 +409,34 @@ def main():
                 else "Flip CH8 (Aux4) high to ARM")
     print(f"\n  >>> {arm_hint} <<<\n")
 
+    # ── Debug logging ─────────────────────────────────────────
+    # Rows are only written while armed (plus the row that trips the pitch
+    # limit) — the disarmed branch never reads the IMU, so there would be
+    # nothing to record.
+    logger = None
+    log_every = max(1, int(round(CONTROL_HZ / max(args.log_hz, 0.01))))
+    if args.log:
+        log_path = args.log
+        if log_path == 'auto':
+            log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "..", "logs")
+            os.makedirs(log_dir, exist_ok=True)
+            log_path = os.path.join(
+                log_dir, time.strftime("balance_%Y%m%d_%H%M%S.csv"))
+        logger = DebugLogger(log_path, LOG_FIELDS)
+        print(f"[Log] Debug logging to {log_path} "
+              f"at {CONTROL_HZ / log_every:.0f} Hz "
+              f"({len(LOG_FIELDS)} columns, armed periods only)\n")
+
     step = 0
+    prev_t_loop = time.monotonic()
     t_start = time.monotonic()
 
     try:
         while not shutdown:
             t_loop = time.monotonic()
+            loop_ms = (t_loop - prev_t_loop) * 1000.0
+            prev_t_loop = t_loop
             elapsed = t_loop - t_start
             if elapsed > args.duration:
                 print("\n[Main] Duration reached.")
@@ -372,7 +445,13 @@ def main():
             # ── Read RC ───────────────────────────────────────
             channels, rc_connected = rc_link.get_channels()
             cmds = rc.map(channels)
-            armed = cmds['armed'] and rc_connected
+            # Releasing the arm switch clears a latched safety trip, so
+            # recovery is an explicit disarm → re-arm by the operator.
+            if not cmds['armed'] and safety_tripped:
+                safety_tripped = False
+                print(f"\n[SAFETY] Trip cleared — ready to arm again")
+
+            armed = cmds['armed'] and rc_connected and not safety_tripped
 
             # Arm/disarm transitions
             if armed and not was_armed:
@@ -405,10 +484,12 @@ def main():
 
                 if step % 400 == 0:
                     rc_status = "linked" if rc_connected else "NO LINK"
+                    hint = ("SAFETY TRIP — release arm to clear"
+                            if safety_tripped else arm_hint)
                     print(f"\r  [DISARMED]{' [STUB]' if sim_mode else ''} "
                           f"t={elapsed:.1f}s  "
                           f"RC={rc_status}  CH8={channels[7]:4d}  "
-                          f"{arm_hint}     ", end='', flush=True)
+                          f"{hint}     ", end='', flush=True)
 
                 step += 1
                 t_end = time.monotonic()
@@ -418,7 +499,12 @@ def main():
                 continue
 
             # ── Read sensors ──────────────────────────────────
-            pitch, pitch_rate, yaw_rate = imu.read()
+            pitch_raw, pitch_rate, yaw_rate = imu.read()
+            # Remove the mounting/CoM bias here, before the filter, so every
+            # consumer below (safety trip, pitch PD, prints, log) works in
+            # "0 = upright" terms. pitch_rate needs no trim: a constant
+            # offset differentiates to zero.
+            pitch = pitch_raw - pitch_trim
 
             pos_l, vel_l, _ = motor.get_state(MOTOR_IDS[0])
             pos_r, vel_r, _ = motor.get_state(MOTOR_IDS[1])
@@ -438,8 +524,39 @@ def main():
             # ── Safety check ──────────────────────────────────
             pitch_deg = math.degrees(pitch_f)
             if abs(pitch_deg) > args.max_pitch:
-                print(f"\n[SAFETY] Pitch {pitch_deg:+.1f}° exceeds ±{args.max_pitch:.0f}° — shutdown!")
-                break
+                # Disarm and latch rather than exit — the process keeps
+                # running so the bot can be picked up and re-armed.
+                trip_count += 1
+                safety_tripped = True
+                motor.send_command(MOTOR_IDS[0], 0, 0, 0, 0, 0)
+                motor.send_command(MOTOR_IDS[1], 0, 0, 0, 0, 0)
+                vel_integral = 0.0
+                pitch_offset = 0.0
+                prev_tff_l = 0.0
+                prev_tff_r = 0.0
+                print(f"\n[SAFETY] Pitch {pitch_deg:+.1f}° exceeds "
+                      f"±{args.max_pitch:.0f}° — DISARMED (trip #{trip_count}). "
+                      f"Disarm, stand it up, then arm again.")
+                if logger is not None:
+                    # Outputs are zero here: the trip pre-empts the control
+                    # math, so only the sensor columns are meaningful.
+                    logger.log(elapsed, 0, 1, rc_connected,
+                               cmd_vel, cmd_pitch, cmd_yaw,
+                               pitch_deg, math.degrees(pitch_raw),
+                               pitch_f, pitch_rate_f, yaw_rate_f,
+                               avg_vel, avg_vel_f, avg_pos,
+                               0.0, 0.0, 0.0,
+                               0.0, 0.0, 0.0,
+                               0.0, 0.0,
+                               0.0, 0.0, 0.0, 0.0,
+                               wheel_vel_l, wheel_vel_r, 0.0, 0.0,
+                               loop_ms)
+                step += 1
+                t_end = time.monotonic()
+                sleep_time = DT - (t_end - t_loop)
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+                continue
 
             # ══════════════════════════════════════════════════
             # Velocity PI → pitch_offset
@@ -507,6 +624,19 @@ def main():
             total_l = hw_kd * (v_target_l - wheel_vel_l) + tff_l
             total_r = hw_kd * (v_target_r - wheel_vel_r) + tff_r
 
+            if logger is not None and step % log_every == 0:
+                logger.log(elapsed, 1, 0, rc_connected,
+                           cmd_vel, cmd_pitch, cmd_yaw,
+                           pitch_deg, math.degrees(pitch_raw),
+                           pitch_f, pitch_rate_f, yaw_rate_f,
+                           avg_vel, avg_vel_f, avg_pos,
+                           vel_error, vel_integral, pitch_offset,
+                           desired_pitch, pitch_error, v_target,
+                           delta_v, delta_tff,
+                           v_target_l, v_target_r, tff_l, tff_r,
+                           wheel_vel_l, wheel_vel_r, total_l, total_r,
+                           loop_ms)
+
             step += 1
 
             # ── Live status (~10 Hz) ─────────────────────────
@@ -524,16 +654,19 @@ def main():
 
             # ── Detailed print ────────────────────────────────
             if step % args.print_every == 0:
-                loop_ms = (time.monotonic() - t_loop) * 1000
+                compute_ms = (time.monotonic() - t_loop) * 1000
                 print(f"\n{'='*65}")
-                print(f"  Step {step}  t={elapsed:.2f}s  loop={loop_ms:.1f}ms")
+                print(f"  Step {step}  t={elapsed:.2f}s  "
+                      f"compute={compute_ms:.1f}ms  period={loop_ms:.1f}ms")
                 print(f"{'='*65}")
                 print(f"  RC:  armed={armed}  connected={rc_connected}")
                 print(f"       cmd_vel={cmd_vel:.3f}  cmd_pitch={cmd_pitch:+.4f}  "
                       f"cmd_yaw={cmd_yaw:+.3f}")
                 print(f"       CH: [{channels[0]:4d} {channels[1]:4d} {channels[2]:4d} "
                       f"{channels[3]:4d} ... {channels[7]:4d}]")
-                print(f"  pitch:       {pitch_f:+.4f} rad ({pitch_deg:+.1f}°)")
+                print(f"  pitch:       {pitch_f:+.4f} rad ({pitch_deg:+.1f}°)"
+                      f"   raw={math.degrees(pitch_raw):+.2f}° "
+                      f"trim={args.pitch_trim:+.2f}°")
                 print(f"  pitch_rate:  {pitch_rate_f:+.4f} rad/s")
                 print(f"  yaw_rate:    {yaw_rate_f:+.4f} rad/s")
                 print(f"  wheel_vel:   L={wheel_vel_l:+.2f}  R={wheel_vel_r:+.2f} rad/s")
@@ -574,6 +707,13 @@ def main():
         motor.close()
         imu.close()
         rc_link.stop()
+        if logger is not None:
+            rows, dropped = logger.close()
+            print(f"[Log] Wrote {rows} rows to {logger.path}"
+                  + (f" ({dropped} dropped — writer fell behind)"
+                     if dropped else ""))
+        if trip_count:
+            print(f"[Main] Pitch safety tripped {trip_count}x this session.")
         print("[Main] Done.")
 
 
