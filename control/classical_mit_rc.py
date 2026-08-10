@@ -160,19 +160,30 @@ YAW_VEL_KD  = 0.02
 YAW_FF_KP   = 0.1
 
 # Integral gain for the yaw rate loop. P-only left a steady-state spin: a
-# constant yaw torque asymmetry (motor friction / chassis contact) is opposed
-# only by a constant error, and on low-friction floors that error was a
-# visible -2.6 rad/s pirouette (13:47 log: delta_v/-yaw_rate == yaw_kp
-# exactly). The integrator accumulates the standing wheel differential that
-# nulls the disturbance instead; ~3 s to null on a slick floor. Simulation
-# favored higher Ki, but ground coupling there is a crude first-order model —
-# raise via --yaw-ki only if a log shows the null is still too slow.
-YAW_KI = 1.0
+# constant yaw torque asymmetry is opposed only by a constant error, a
+# visible -2.6 rad/s pirouette on low-friction floors (13:47 log). The
+# integrator accumulates the standing wheel differential that nulls it.
+# 14:09 log post-mortem: 1.0 was too hot for stick-slip floors — during a
+# slip the ground ignores the differential, the integral winds, and the
+# stored kick reversed the spin on grip-catch and caused a fall. 0.5 plus
+# the gate/drain guards below is the retreat from that.
+YAW_KI = 0.5
 # Max wheel differential the integral term may contribute, rad/s. The 13:47
 # log still spun with a 1.4 rad/s standing differential applied, so the null
 # point on slick floors needs headroom beyond that; stays under the ±3
 # overall differential cap.
 YAW_INT_LIMIT = 2.5
+# Freeze integration when |yaw_error| exceeds this, rad/s. Trimmable drift
+# is a few rad/s at most; anything wilder is a slip event where integrating
+# only stores kick energy for the moment the tire grips again.
+YAW_INT_GATE = 4.0
+# Drain time constant, seconds, applied whenever the integral has the same
+# sign as the measured spin — i.e. it is pushing the robot around, not
+# opposing it. That sign combination only occurs after a grip-catch
+# reversal (14:09 log, t=1.9-2.2: integral +1.9 while already spinning CW,
+# actively accelerating it into a fall). Steady-drift trimming always has
+# opposite signs and is untouched.
+YAW_INT_DRAIN_TAU = 0.15
 
 PRINT_EVERY = 200
 
@@ -666,18 +677,25 @@ def main():
             dv_max = min(3.0, yaw_budget)
 
             # PI + damping. The integral nulls constant yaw-torque asymmetry
-            # (P-only left a standing spin on low-friction floors). Same
-            # conditional-integration guard as the velocity loop: only
-            # accumulate while the output is unsaturated, or while the error
-            # would unwind the integral — a budget-starved recovery must not
-            # wind it up.
+            # (P-only left a standing spin on low-friction floors). Guards,
+            # each from a logged failure:
+            #   unsaturated-or-unwinding — budget-starved recovery must not
+            #     wind it (13:27 falls);
+            #   gate — a wild slip is not trimmable drift, do not store kick
+            #     energy against the grip-catch (14:09 fall);
+            #   drain — if the integral ever points WITH the measured spin
+            #     it is driving the robot around, dump it fast (14:09 fall).
             delta_v_raw = (yaw_kp * yaw_error + yaw_ki * yaw_integral
                            + YAW_VEL_KD * (-yaw_deriv))
             delta_v = clamp(delta_v_raw, -dv_max, dv_max)
-            if delta_v_raw == delta_v or yaw_error * yaw_integral < 0.0:
+            unsat_or_unwind = (delta_v_raw == delta_v
+                               or yaw_error * yaw_integral < 0.0)
+            if unsat_or_unwind and abs(yaw_error) < YAW_INT_GATE:
                 yaw_integral += yaw_error * DT
                 max_yint = YAW_INT_LIMIT / max(yaw_ki, 1e-6)
                 yaw_integral = clamp(yaw_integral, -max_yint, max_yint)
+            if yaw_integral * yaw_rate_f > 0.0:
+                yaw_integral -= yaw_integral * (DT / YAW_INT_DRAIN_TAU)
 
             delta_tff = clamp(YAW_FF_KP * yaw_error, -1.0, 1.0)
 
