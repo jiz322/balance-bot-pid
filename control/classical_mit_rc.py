@@ -109,7 +109,11 @@ MAX_PITCH_DEG = 30.0
 # here. If it reads +0.8° when balanced, this is +0.8. Getting the sign wrong
 # doubles the lean instead of removing it, so check that the printed pitch
 # lands near 0.0° at balance after changing it.
-PITCH_TRIM_DEG = 0.8
+#
+# 0.1 was derived from the 2026-08-10 13:13 log: across force-free windows
+# (integrator flat, wheels still) the bot settled at -0.71deg with trim 0.8,
+# so the earlier hand-held estimate of 0.8 overshot by that much.
+PITCH_TRIM_DEG = 0.1
 
 LEFT_DIR  = -1
 RIGHT_DIR = 1
@@ -132,10 +136,14 @@ VEL_KI = 0.01
 VEL_INTEGRATOR_LIMIT = 0.10
 
 # Ceiling on the lean angle the velocity loop may ask for, in radians.
-# The velocity PI must not out-authority the balance loop it sits on top of:
-# at the old ±0.10 (5.7°) a saturated integrator commanded maximum lean into
-# a bot that was already falling. 0.035 rad is ~2°.
-PITCH_OFFSET_LIMIT = 0.035
+# The velocity PI must not out-authority the balance loop it sits on top of.
+# History: ±0.10 (5.7°) let a wound-up integrator command full lean into a
+# falling bot; ±0.035 (2°) fixed that but starved push recovery — the
+# 2026-08-10 13:13 log shows demand exceeding it 48% of the time and a fall
+# with the offset pinned while the bot ran away backward. Now that the
+# integrator freezes at wheel saturation (conditional integration below),
+# the runaway path is closed and ±0.07 (~4°) restores braking authority.
+PITCH_OFFSET_LIMIT = 0.07
 
 # ── Position hold ─────────────────────────────────────────────
 POS_KP = 0.0
