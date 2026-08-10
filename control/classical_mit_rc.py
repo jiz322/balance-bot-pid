@@ -90,19 +90,13 @@ LOG_FIELDS = [
     'avg_vel', 'avg_vel_f', 'avg_pos',
     'vel_err', 'vel_integral', 'pitch_offset',
     'desired_pitch', 'pitch_error', 'v_target',
-    'delta_v', 'delta_tff', 'yaw_integral',
+    'delta_v', 'delta_tff',
     'v_target_l', 'v_target_r', 'tff_l', 'tff_r',
     'wheel_vel_l', 'wheel_vel_r', 'total_l', 'total_r',
     'loop_ms',
 ]
 
-# Measured wheel-speed ceiling, not a preference: across every 2026-08-10 log
-# the motors never exceeded 10.0 rad/s no matter what was commanded (15-60
-# requested -> 10 delivered). Keeping this at the old 15 made the anti-windup
-# blind in the 10-15 band: the integrator kept winding on speed the wheels
-# could not deliver. Raise only if the hardware demonstrably gets faster
-# (bigger battery / different motors), never past what a log shows achievable.
-MAX_VEL_CMD   = 10.0
+MAX_VEL_CMD   = 15.0
 MAX_TORQUE_FF = 4.0
 MAX_PITCH_DEG = 30.0
 
@@ -158,33 +152,6 @@ POS_KP = 0.0
 YAW_VEL_KP  = 0.3
 YAW_VEL_KD  = 0.02
 YAW_FF_KP   = 0.1
-
-# Integral gain for the yaw rate loop. DEFAULT 0 = disabled, by field
-# result, not by theory: the integrator was added to null a benign -2.6
-# rad/s standing pirouette on slick floors (13:47 log), but on that same
-# floor it twice made things worse — Ki=1.0 wound up during wheel slip and
-# the stored differential whipped the robot around on grip-catch (14:09,
-# one fall), and Ki=0.5 with the gate/drain guards below still spun fast
-# (14:19). Ki=0 (14:20 log) was the calmest yaw of any run: p95 0.82 rad/s.
-# Stick-slip floors defeat integral action here; the guards remain for
-# opting in via --yaw-ki on surfaces with consistent grip (carpet, rubber).
-YAW_KI = 0.0
-# Max wheel differential the integral term may contribute, rad/s. The 13:47
-# log still spun with a 1.4 rad/s standing differential applied, so the null
-# point on slick floors needs headroom beyond that; stays under the ±3
-# overall differential cap.
-YAW_INT_LIMIT = 2.5
-# Freeze integration when |yaw_error| exceeds this, rad/s. Trimmable drift
-# is a few rad/s at most; anything wilder is a slip event where integrating
-# only stores kick energy for the moment the tire grips again.
-YAW_INT_GATE = 4.0
-# Drain time constant, seconds, applied whenever the integral has the same
-# sign as the measured spin — i.e. it is pushing the robot around, not
-# opposing it. That sign combination only occurs after a grip-catch
-# reversal (14:09 log, t=1.9-2.2: integral +1.9 while already spinning CW,
-# actively accelerating it into a fall). Steady-drift trimming always has
-# opposite signs and is untouched.
-YAW_INT_DRAIN_TAU = 0.15
 
 PRINT_EVERY = 200
 
@@ -283,7 +250,6 @@ def main():
     parser.add_argument("--pos-kp",      type=float, default=POS_KP)
     # Yaw
     parser.add_argument("--yaw-kp",      type=float, default=YAW_VEL_KP)
-    parser.add_argument("--yaw-ki",      type=float, default=YAW_KI)
     # RC ranges
     parser.add_argument("--max-vel",     type=float, default=2.0)
     parser.add_argument("--max-yaw",     type=float, default=2.0)
@@ -296,7 +262,6 @@ def main():
     vel_ki   = args.vel_ki
     pos_kp   = args.pos_kp
     yaw_kp   = args.yaw_kp
-    yaw_ki   = args.yaw_ki
     hw_kd    = args.kd
     pitch_trim = math.radians(args.pitch_trim)
 
@@ -412,7 +377,6 @@ def main():
     # ── State variables ───────────────────────────────────────
     vel_integral   = 0.0
     pitch_offset   = 0.0
-    yaw_integral   = 0.0
     prev_yaw_rate  = 0.0
     # Set when the previous iteration's v_target hit MAX_VEL_CMD. Freezes the
     # velocity integrator while the wheels are already maxed out, since more
@@ -431,10 +395,7 @@ def main():
     # carries the damping term, where lag costs the most. 0.25 cuts this
     # path's time constant from 18.3 ms to 7.5 ms.
     pitch_rate_filter = LowPassFilter(alpha=0.25)
-    # 0.05 = 49 ms time constant (was 0.02 = 122 ms). The velocity loop is
-    # the runaway brake; logged falls built ground speed over ~1.5 s, and the
-    # slower filter delayed the braking response by most of a swing period.
-    vel_filter        = LowPassFilter(alpha=0.05)
+    vel_filter        = LowPassFilter(alpha=0.02)
     yaw_rate_filter   = LowPassFilter(alpha=0.09)
 
     MAX_TORQUE_RATE = 2.0 * DT
@@ -455,7 +416,7 @@ def main():
     print(f"  Pitch→Vel: Kp={pitch_kp:.1f}  Kd={pitch_kd:.2f}")
     print(f"  Vel→Pitch: Kp={vel_kp:.3f}  Ki={vel_ki:.3f}")
     print(f"  Pos→Vel:   Kp={pos_kp:.3f}")
-    print(f"  Yaw:       Kp={yaw_kp:.2f}  Ki={yaw_ki:.2f}")
+    print(f"  Yaw:       Kp={yaw_kp:.2f}")
     print(f"  RC ranges: vel=[0, {args.max_vel}]  "
           f"pitch=[±{args.max_cmd_pitch}]  yaw=[±{args.max_yaw}]")
     print(f"  RC map:    CH3→vel  CH2→pitch  CH4→yaw  CH8→arm")
@@ -524,7 +485,6 @@ def main():
                 # Reset integrators on arm
                 vel_integral = 0.0
                 pitch_offset = 0.0
-                yaw_integral = 0.0
                 vel_saturated = False
                 prev_tff_l = 0.0
                 prev_tff_r = 0.0
@@ -546,7 +506,6 @@ def main():
                 # Reset state
                 vel_integral = 0.0
                 pitch_offset = 0.0
-                yaw_integral = 0.0
                 vel_saturated = False
                 prev_tff_l = 0.0
                 prev_tff_r = 0.0
@@ -601,7 +560,6 @@ def main():
                 motor.send_command(MOTOR_IDS[1], 0, 0, 0, 0, 0)
                 vel_integral = 0.0
                 pitch_offset = 0.0
-                yaw_integral = 0.0
                 vel_saturated = False
                 prev_tff_l = 0.0
                 prev_tff_r = 0.0
@@ -618,7 +576,7 @@ def main():
                                avg_vel, avg_vel_f, avg_pos,
                                0.0, 0.0, 0.0,
                                0.0, 0.0, 0.0,
-                               0.0, 0.0, 0.0,
+                               0.0, 0.0,
                                0.0, 0.0, 0.0, 0.0,
                                wheel_vel_l, wheel_vel_r, 0.0, 0.0,
                                loop_ms)
@@ -669,35 +627,7 @@ def main():
             yaw_deriv = (yaw_rate_f - prev_yaw_rate) / DT
             prev_yaw_rate = yaw_rate_f
 
-            # Yaw yields to balance: the differential may only spend wheel
-            # speed the pitch loop is not using. Without this, a spin command
-            # near saturation clips one wheel but not the other, turning the
-            # yaw stick into a pitch disturbance mid-recovery (222 such rows
-            # and 3 of 5 falls with yaw active in the 13:27 log).
-            yaw_budget = max(0.0, MAX_VEL_CMD - abs(v_target))
-            dv_max = min(3.0, yaw_budget)
-
-            # PI + damping. The integral nulls constant yaw-torque asymmetry
-            # (P-only left a standing spin on low-friction floors). Guards,
-            # each from a logged failure:
-            #   unsaturated-or-unwinding — budget-starved recovery must not
-            #     wind it (13:27 falls);
-            #   gate — a wild slip is not trimmable drift, do not store kick
-            #     energy against the grip-catch (14:09 fall);
-            #   drain — if the integral ever points WITH the measured spin
-            #     it is driving the robot around, dump it fast (14:09 fall).
-            delta_v_raw = (yaw_kp * yaw_error + yaw_ki * yaw_integral
-                           + YAW_VEL_KD * (-yaw_deriv))
-            delta_v = clamp(delta_v_raw, -dv_max, dv_max)
-            unsat_or_unwind = (delta_v_raw == delta_v
-                               or yaw_error * yaw_integral < 0.0)
-            if yaw_ki > 0.0 and unsat_or_unwind and abs(yaw_error) < YAW_INT_GATE:
-                yaw_integral += yaw_error * DT
-                max_yint = YAW_INT_LIMIT / max(yaw_ki, 1e-6)
-                yaw_integral = clamp(yaw_integral, -max_yint, max_yint)
-            if yaw_integral * yaw_rate_f > 0.0:
-                yaw_integral -= yaw_integral * (DT / YAW_INT_DRAIN_TAU)
-
+            delta_v = clamp(yaw_kp * yaw_error + YAW_VEL_KD * (-yaw_deriv), -3.0, 3.0)
             delta_tff = clamp(YAW_FF_KP * yaw_error, -1.0, 1.0)
 
             # ══════════════════════════════════════════════════
@@ -739,7 +669,7 @@ def main():
                            avg_vel, avg_vel_f, avg_pos,
                            vel_error, vel_integral, pitch_offset,
                            desired_pitch, pitch_error, v_target,
-                           delta_v, delta_tff, yaw_integral,
+                           delta_v, delta_tff,
                            v_target_l, v_target_r, tff_l, tff_r,
                            wheel_vel_l, wheel_vel_r, total_l, total_r,
                            loop_ms)
@@ -786,8 +716,7 @@ def main():
                 print(f"  pitch_error: {pitch_error:+.4f} rad")
                 print(f"  v_target:    {v_target:+.3f} rad/s")
                 print(f"  ---")
-                print(f"  yaw_error:   {yaw_error:+.4f}   delta_v: {delta_v:+.3f}   "
-                      f"yaw_int: {yaw_integral:+.3f}")
+                print(f"  yaw_error:   {yaw_error:+.4f}   delta_v: {delta_v:+.3f}")
                 print(f"  ---")
                 print(f"  v_des:       L={v_target_l:+.2f}  R={v_target_r:+.2f} rad/s")
                 print(f"  t_ff:        L={tff_l:+.3f}  R={tff_r:+.3f} Nm")
