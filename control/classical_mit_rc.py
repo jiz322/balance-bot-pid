@@ -159,16 +159,15 @@ YAW_VEL_KP  = 0.3
 YAW_VEL_KD  = 0.02
 YAW_FF_KP   = 0.1
 
-# Integral gain for the yaw rate loop. DEFAULT 0 = disabled, by field
-# result, not by theory: the integrator was added to null a benign -2.6
-# rad/s standing pirouette on slick floors (13:47 log), but on that same
-# floor it twice made things worse — Ki=1.0 wound up during wheel slip and
-# the stored differential whipped the robot around on grip-catch (14:09,
-# one fall), and Ki=0.5 with the gate/drain guards below still spun fast
-# (14:19). Ki=0 (14:20 log) was the calmest yaw of any run: p95 0.82 rad/s.
-# Stick-slip floors defeat integral action here; the guards remain for
-# opting in via --yaw-ki on surfaces with consistent grip (carpet, rubber).
-YAW_KI = 0.0
+# Integral gain for the yaw rate loop. P-only left a steady-state spin: a
+# constant yaw torque asymmetry is opposed only by a constant error, a
+# visible -2.6 rad/s pirouette on low-friction floors (13:47 log). The
+# integrator accumulates the standing wheel differential that nulls it.
+# 14:09 log post-mortem: 1.0 was too hot for stick-slip floors — during a
+# slip the ground ignores the differential, the integral winds, and the
+# stored kick reversed the spin on grip-catch and caused a fall. 0.5 plus
+# the gate/drain guards below is the retreat from that.
+YAW_KI = 0.5
 # Max wheel differential the integral term may contribute, rad/s. The 13:47
 # log still spun with a 1.4 rad/s standing differential applied, so the null
 # point on slick floors needs headroom beyond that; stays under the ±3
@@ -691,7 +690,7 @@ def main():
             delta_v = clamp(delta_v_raw, -dv_max, dv_max)
             unsat_or_unwind = (delta_v_raw == delta_v
                                or yaw_error * yaw_integral < 0.0)
-            if yaw_ki > 0.0 and unsat_or_unwind and abs(yaw_error) < YAW_INT_GATE:
+            if unsat_or_unwind and abs(yaw_error) < YAW_INT_GATE:
                 yaw_integral += yaw_error * DT
                 max_yint = YAW_INT_LIMIT / max(yaw_ki, 1e-6)
                 yaw_integral = clamp(yaw_integral, -max_yint, max_yint)
