@@ -119,13 +119,23 @@ HW_KP = 0.0
 HW_KD = 0.6
 
 # ── Pitch → Velocity ─────────────────────────────────────────
-PITCH_KP = 75.0
-PITCH_KD = 3.5
+# Tuned down from 75/3.5, which were set against a 400 Hz IMU. A 100 Hz IMU
+# holds each sample for 4 control iterations, adding ~4 ms of pure delay that
+# ate the remaining phase margin: logs showed a 4.8 Hz oscillation growing
+# ~9%/cycle. Neutral stability needs only ~x0.92; this is x0.73 for margin.
+PITCH_KP = 55.0
+PITCH_KD = 2.6
 
 # ── Velocity tracking ────────────────────────────────────────
 VEL_KP = 0.08
 VEL_KI = 0.01
 VEL_INTEGRATOR_LIMIT = 0.10
+
+# Ceiling on the lean angle the velocity loop may ask for, in radians.
+# The velocity PI must not out-authority the balance loop it sits on top of:
+# at the old ±0.10 (5.7°) a saturated integrator commanded maximum lean into
+# a bot that was already falling. 0.035 rad is ~2°.
+PITCH_OFFSET_LIMIT = 0.035
 
 # ── Position hold ─────────────────────────────────────────────
 POS_KP = 0.0
@@ -360,6 +370,10 @@ def main():
     vel_integral   = 0.0
     pitch_offset   = 0.0
     prev_yaw_rate  = 0.0
+    # Set when the previous iteration's v_target hit MAX_VEL_CMD. Freezes the
+    # velocity integrator while the wheels are already maxed out, since more
+    # integral cannot buy speed the motors do not have.
+    vel_saturated  = False
     was_armed      = False
     # Latched by the pitch safety trip. Blocks arming until the operator
     # cycles the arm switch/button low again, so the bot cannot re-arm on
@@ -368,7 +382,11 @@ def main():
     trip_count     = 0
 
     pitch_filter      = LowPassFilter(alpha=0.12)
-    pitch_rate_filter = LowPassFilter(alpha=0.12)
+    # Raised from 0.12: pitch_rate is the raw gyro, not a differentiated
+    # signal, so it needs far less smoothing than attitude does — and it
+    # carries the damping term, where lag costs the most. 0.25 cuts this
+    # path's time constant from 18.3 ms to 7.5 ms.
+    pitch_rate_filter = LowPassFilter(alpha=0.25)
     vel_filter        = LowPassFilter(alpha=0.02)
     yaw_rate_filter   = LowPassFilter(alpha=0.09)
 
@@ -459,6 +477,7 @@ def main():
                 # Reset integrators on arm
                 vel_integral = 0.0
                 pitch_offset = 0.0
+                vel_saturated = False
                 prev_tff_l = 0.0
                 prev_tff_r = 0.0
             elif not armed and was_armed:
@@ -479,6 +498,7 @@ def main():
                 # Reset state
                 vel_integral = 0.0
                 pitch_offset = 0.0
+                vel_saturated = False
                 prev_tff_l = 0.0
                 prev_tff_r = 0.0
 
@@ -532,6 +552,7 @@ def main():
                 motor.send_command(MOTOR_IDS[1], 0, 0, 0, 0, 0)
                 vel_integral = 0.0
                 pitch_offset = 0.0
+                vel_saturated = False
                 prev_tff_l = 0.0
                 prev_tff_r = 0.0
                 print(f"\n[SAFETY] Pitch {pitch_deg:+.1f}° exceeds "
@@ -568,12 +589,19 @@ def main():
             effective_vel_cmd = cmd_vel + pos_correction
             vel_error = effective_vel_cmd - avg_vel_f
 
-            vel_integral += vel_error * DT
-            max_int = VEL_INTEGRATOR_LIMIT / max(vel_ki, 1e-6)
-            vel_integral = clamp(vel_integral, -max_int, max_int)
+            # Conditional integration: only accumulate while there is still
+            # wheel speed left to spend. Integrating through saturation is
+            # what turned a bounded oscillation into a fall — the integrator
+            # ramped to -7.0 and pinned pitch_offset at full lean while the
+            # wheels were already stuck at their limit.
+            if not vel_saturated or vel_error * vel_integral < 0.0:
+                vel_integral += vel_error * DT
+                max_int = VEL_INTEGRATOR_LIMIT / max(vel_ki, 1e-6)
+                vel_integral = clamp(vel_integral, -max_int, max_int)
 
             pitch_offset = vel_kp * vel_error + vel_ki * vel_integral
-            pitch_offset = clamp(pitch_offset, -0.10, 0.10)
+            pitch_offset = clamp(pitch_offset,
+                                 -PITCH_OFFSET_LIMIT, PITCH_OFFSET_LIMIT)
 
             # ══════════════════════════════════════════════════
             # Pitch PD → v_target
@@ -582,6 +610,7 @@ def main():
             pitch_error   = pitch_f - desired_pitch
 
             v_target = pitch_kp * pitch_error + pitch_kd * pitch_rate_f
+            vel_saturated = abs(v_target) > MAX_VEL_CMD
 
             # ══════════════════════════════════════════════════
             # Yaw — differential velocity + torque
