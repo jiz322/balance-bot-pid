@@ -96,7 +96,13 @@ LOG_FIELDS = [
     'loop_ms',
 ]
 
-MAX_VEL_CMD   = 15.0
+# Measured wheel-speed ceiling, not a preference: across every 2026-08-10 log
+# the motors never exceeded 10.0 rad/s no matter what was commanded (15-60
+# requested -> 10 delivered). Keeping this at the old 15 made the anti-windup
+# blind in the 10-15 band: the integrator kept winding on speed the wheels
+# could not deliver. Raise only if the hardware demonstrably gets faster
+# (bigger battery / different motors), never past what a log shows achievable.
+MAX_VEL_CMD   = 10.0
 MAX_TORQUE_FF = 4.0
 MAX_PITCH_DEG = 30.0
 
@@ -395,7 +401,10 @@ def main():
     # carries the damping term, where lag costs the most. 0.25 cuts this
     # path's time constant from 18.3 ms to 7.5 ms.
     pitch_rate_filter = LowPassFilter(alpha=0.25)
-    vel_filter        = LowPassFilter(alpha=0.02)
+    # 0.05 = 49 ms time constant (was 0.02 = 122 ms). The velocity loop is
+    # the runaway brake; logged falls built ground speed over ~1.5 s, and the
+    # slower filter delayed the braking response by most of a swing period.
+    vel_filter        = LowPassFilter(alpha=0.05)
     yaw_rate_filter   = LowPassFilter(alpha=0.09)
 
     MAX_TORQUE_RATE = 2.0 * DT
@@ -627,7 +636,15 @@ def main():
             yaw_deriv = (yaw_rate_f - prev_yaw_rate) / DT
             prev_yaw_rate = yaw_rate_f
 
-            delta_v = clamp(yaw_kp * yaw_error + YAW_VEL_KD * (-yaw_deriv), -3.0, 3.0)
+            # Yaw yields to balance: the differential may only spend wheel
+            # speed the pitch loop is not using. Without this, a spin command
+            # near saturation clips one wheel but not the other, turning the
+            # yaw stick into a pitch disturbance mid-recovery (222 such rows
+            # and 3 of 5 falls with yaw active in the 13:27 log).
+            yaw_budget = max(0.0, MAX_VEL_CMD - abs(v_target))
+            dv_max = min(3.0, yaw_budget)
+            delta_v = clamp(yaw_kp * yaw_error + YAW_VEL_KD * (-yaw_deriv),
+                            -dv_max, dv_max)
             delta_tff = clamp(YAW_FF_KP * yaw_error, -1.0, 1.0)
 
             # ══════════════════════════════════════════════════
